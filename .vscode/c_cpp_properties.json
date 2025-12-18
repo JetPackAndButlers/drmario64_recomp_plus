@@ -5,6 +5,10 @@
             "includePath": [
                 "${workspaceFolder}/**",
                 "include",
+				"lib/drmario64/include",
+				"lib/drmario64/lib/ultralib/include",
+				"lib/drmario64/lib/ultralib/include/PR",
+				"lib/rt64/include",
                 "lib/N64ModernRuntime/ultramodern/include",
                 "lib/N64ModernRuntime/librecomp/include/librecomp",
                 "lib/N64ModernRuntime/thirdparty/concurrentqueue",

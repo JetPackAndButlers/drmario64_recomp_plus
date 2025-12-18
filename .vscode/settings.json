@@ -93,5 +93,6 @@
         "expected": "cpp",
         "coroutine": "cpp",
         "ranges": "cpp"
-    }
+    },
+    "chatgpt.commentCodeLensEnabled": true
 }
