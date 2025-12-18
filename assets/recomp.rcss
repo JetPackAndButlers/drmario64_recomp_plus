@@ -1937,7 +1937,7 @@ scrollbarhorizontal sliderbar {
   display: flex;
   position: absolute;
   top: 0;
-  right: 50%;
+  right: 20%;
   bottom: 0;
   left: 0;
   flex-direction: column;
@@ -1964,7 +1964,7 @@ scrollbarhorizontal sliderbar {
   top: -55vw;
   right: -100%;
   bottom: -50vw;
-  left: -70vw;
+  left: -10vw;
   align-items: center;
   justify-content: flex-start;
   transform: translateX(0dp);
@@ -1976,7 +1976,7 @@ scrollbarhorizontal sliderbar {
     opacity: 0;
   }
   100% {
-    opacity: 0.1;
+    opacity: 0.33;
   }
 }
 .launcher__background-mm {
@@ -1987,7 +1987,7 @@ scrollbarhorizontal sliderbar {
   width: auto;
   height: 100%;
   animation: 2.5s cubic-in-out 1 fade-mm-in;
-  opacity: 0.1;
+  opacity: 0.33;
 }
 
 .launcher__title-quadrant {
@@ -2077,7 +2077,7 @@ scrollbarhorizontal sliderbar {
     Example layout:
 
         <button class="subtitle-title" disabled>
-            <h3>Zelda 64: Recompiled</h3>
+            <h3>Dr. Mario: Recompiled</h3>
             <h1>Ocarina of Time</h1>
             <div class="subtitle-title__disclaimer">Coming Soon™</div>
         </button>
