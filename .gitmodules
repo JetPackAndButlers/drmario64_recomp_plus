@@ -22,3 +22,6 @@
 [submodule "lib/N64ModernRuntime"]
 	path = lib/N64ModernRuntime
 	url = git@github.com:N64Recomp/N64ModernRuntime.git
+[submodule "lib/drmario64"]
+	path = lib/drmario64
+	url = https://github.com/AngheloAlf/drmario64.git
