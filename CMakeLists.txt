@@ -301,7 +301,31 @@ if (WIN32)
             LINK_FLAGS_MINSIZEREL "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup"
     )
 
-    target_sources(drmario64_recomp PRIVATE ${CMAKE_SOURCE_DIR}/icons/app.rc)
+    # clang-cl + CMake uses a preprocessing wrapper for .rc files that can be brittle with long command lines.
+    # Build the .res explicitly with `rc.exe` instead.
+    set(WINDOWS_RC "${CMAKE_RC_COMPILER}")
+    set(APP_ICON_RES "${CMAKE_CURRENT_BINARY_DIR}/app_icon.res")
+    add_custom_command(
+        OUTPUT "${APP_ICON_RES}"
+        COMMAND "${WINDOWS_RC}" /nologo /fo "${APP_ICON_RES}" "${CMAKE_SOURCE_DIR}/icons/app.rc"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/icons"
+        DEPENDS
+            "${CMAKE_SOURCE_DIR}/icons/app.rc"
+            "${CMAKE_SOURCE_DIR}/icons/app.ico"
+            "${CMAKE_SOURCE_DIR}/icons/256.ico"
+            "${CMAKE_SOURCE_DIR}/icons/128.ico"
+            "${CMAKE_SOURCE_DIR}/icons/96.ico"
+            "${CMAKE_SOURCE_DIR}/icons/64.ico"
+            "${CMAKE_SOURCE_DIR}/icons/48.ico"
+            "${CMAKE_SOURCE_DIR}/icons/32.ico"
+            "${CMAKE_SOURCE_DIR}/icons/24.ico"
+            "${CMAKE_SOURCE_DIR}/icons/16.ico"
+        VERBATIM
+    )
+    # Treat the generated .res as an external object so it is passed to the linker.
+    # Without this, Ninja+clang-cl may build the file but omit it from the link line, resulting in no icon.
+    set_source_files_properties("${APP_ICON_RES}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+    target_sources(drmario64_recomp PRIVATE "${APP_ICON_RES}")
     target_link_libraries(drmario64_recomp PRIVATE SDL2)
 endif()
 
@@ -360,6 +384,29 @@ target_link_libraries(drmario64_recomp PRIVATE
     RmlUi::Debugger
     nfd
     lunasvg
+)
+
+# Some Windows toolchain setups using clang + lld don't always pull in the C++ runtime automatically
+# when resolving symbols from static libraries (e.g. __std_search_1). Link it explicitly.
+if (WIN32 AND MSVC)
+    target_link_libraries(drmario64_recomp PRIVATE
+        "$<$<CONFIG:Debug>:msvcprtd>"
+        "$<$<NOT:$<CONFIG:Debug>>:msvcprt>"
+    )
+endif()
+
+# Copy runtime assets next to the executable so it can be launched from the build directory.
+add_custom_command(TARGET drmario64_recomp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/assets"
+        "$<TARGET_FILE_DIR:drmario64_recomp>/assets"
+)
+
+# Copy icons next to the executable (used by the controller assignment prompt and other platform-specific bits).
+add_custom_command(TARGET drmario64_recomp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/icons"
+        "$<TARGET_FILE_DIR:drmario64_recomp>/icons"
 )
 
 # TODO fix the rt64 CMake script so that this doesn't need to be duplicated here
