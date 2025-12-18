@@ -6,6 +6,7 @@
 #include "RmlUi/Core.h"
 #include "nfd.h"
 #include <filesystem>
+#include "recomp_input.h"
 
 static std::string version_string;
 
@@ -79,8 +80,21 @@ public:
         );
         recompui::register_event(listener, "start_game",
             [](const std::string& param, Rml::Event& event) {
-                recomp::start_game(supported_games[0].game_id);
-                recompui::hide_all_contexts();
+                recomp::scan_controllers();
+                recomp::refresh_controller_options();
+                const int detected = (int)recomp::get_controller_options().size();
+
+                auto start = []() {
+                    zelda64::save_config();
+                    recomp::start_game(supported_games[0].game_id);
+                    recompui::hide_all_contexts();
+                };
+
+                if (detected > 1) {
+                    recomp::begin_controller_assignment(detected, start, start);
+                } else {
+                    start();
+                }
             }
         );
         recompui::register_event(listener, "open_controls",

@@ -8,6 +8,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <functional>
 
 #include "ultramodern/input.hpp"
 
@@ -70,13 +71,13 @@ namespace recomp {
     };
 
     void poll_inputs();
-    float get_input_analog(const InputField& field);
-    float get_input_analog(const std::span<const recomp::InputField> fields);
-    bool get_input_digital(const InputField& field);
-    bool get_input_digital(const std::span<const recomp::InputField> fields);
+    float get_input_analog(int controller_num, const InputField& field);
+    float get_input_analog(int controller_num, const std::span<const recomp::InputField> fields);
+    bool get_input_digital(int controller_num, const InputField& field);
+    bool get_input_digital(int controller_num, const std::span<const recomp::InputField> fields);
     void get_gyro_deltas(float* x, float* y);
     void get_mouse_deltas(float* x, float* y);
-    void get_right_analog(float* x, float* y);
+    void get_right_analog(int controller_num, float* x, float* y);
 
     enum class InputDevice {
         Controller,
@@ -157,15 +158,52 @@ namespace recomp {
     const std::string& get_input_name(GameInput input);
     const std::string& get_input_enum_name(GameInput input);
     GameInput get_input_from_enum_name(const std::string_view name);
-    InputField& get_input_binding(GameInput input, size_t binding_index, InputDevice device);
-    void set_input_binding(GameInput input, size_t binding_index, InputDevice device, InputField value);
+    InputField& get_input_binding(int controller_num, GameInput input, size_t binding_index, InputDevice device);
+    void set_input_binding(int controller_num, GameInput input, size_t binding_index, InputDevice device,
+                           InputField value);
+
+    struct ControllerGUID {
+        std::string serial;
+        int vendor{};
+        int product{};
+        int version{};
+        int crc16{};
+        int player_index{};
+    };
+
+    void set_input_controller_guid(int controller_num, const ControllerGUID& guid);
+    ControllerGUID get_input_controller_guid(int controller_num);
+
+    struct ControllerOption {
+        std::string name;
+        ControllerGUID guid;
+    };
+
+    void refresh_controller_options();
+    const std::vector<ControllerOption>& get_controller_options();
 
     bool get_n64_input(int controller_num, uint16_t* buttons_out, float* x_out, float* y_out);
     void set_rumble(int controller_num, bool);
     void update_rumble();
     void handle_events();
 
+    // Opens all currently connected controllers (useful at startup, since hotplug events alone may miss pre-connected devices).
+    void scan_controllers();
+
     ultramodern::input::connected_device_info_t get_connected_device_info(int controller_num);
+
+    // Whether an N64 controller slot should report a response (used for controller presence detection).
+    bool n64_controller_present(int controller_num);
+
+    // Interactive controller ordering: asks players to press a button to assign controller order.
+    // Policy:
+    // - 0/1 controllers: no prompt.
+    // - 2/3 controllers: prompt players 1..N.
+    // - exactly 4 controllers: prompt players 1..3, auto-assign remaining controller to player 4.
+    // - 5+ controllers: prompt players 1..4.
+    void begin_controller_assignment(int detected_controller_count, std::function<void()> on_complete, std::function<void()> on_cancel);
+    void cancel_controller_assignment();
+    bool is_controller_assignment_active();
     
     // Rumble strength ranges from 0 to 100.
     int get_rumble_strength();
@@ -194,6 +232,11 @@ namespace recomp {
 
     BackgroundInputMode get_background_input_mode();
     void set_background_input_mode(BackgroundInputMode mode);
+
+    
+    bool get_single_controller_mode();
+    void set_single_controller_mode(bool single_controller);
+
 
     bool game_input_disabled();
     bool all_input_disabled();

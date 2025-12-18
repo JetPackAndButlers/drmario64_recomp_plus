@@ -112,6 +112,10 @@ namespace recompui {
         const std::string& content_text,
         const std::string& return_element_id = ""
     );
+    // Shows a row of progress "pills" on the notification prompt.
+    // `completed` is how many steps are done, `total` is total steps shown (max 4).
+    void set_prompt_progress(int completed, int total);
+    void clear_prompt_progress();
     void close_prompt();
     bool is_prompt_open();
     void update_mod_list(bool scan_mods = true);

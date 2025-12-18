@@ -1,13 +1,22 @@
 #include <mutex>
+#include <filesystem>
+#include <fstream>
+#include <array>
+#include <cstdint>
 
 #include "recomp_ui.h"
 
 #include "elements/ui_element.h"
 #include "elements/ui_label.h"
 #include "elements/ui_button.h"
+#include "elements/ui_image.h"
 
 struct {
     recompui::ContextId ui_context;
+    recompui::Image* prompt_icon;
+    bool prompt_icon_available = false;
+    recompui::Element* prompt_progress_container;
+    std::array<recompui::Image*, 4> prompt_progress_icons;
     recompui::Label* prompt_header;
     recompui::Label* prompt_label;
     recompui::Element* prompt_controls;
@@ -18,6 +27,166 @@ struct {
     std::string return_element_id;
     std::mutex mutex;
 } prompt_state;
+
+static constexpr const char* prompt_icon_src = "?/builtin/app_icon";
+
+static bool try_read_file_bytes(const std::filesystem::path& path, std::vector<char>& out_bytes) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+
+    file.seekg(0, std::ios::end);
+    std::streampos size = file.tellg();
+    if (size <= 0) {
+        return false;
+    }
+    file.seekg(0, std::ios::beg);
+
+    out_bytes.resize(static_cast<size_t>(size));
+    if (!file.read(out_bytes.data(), size)) {
+        out_bytes.clear();
+        return false;
+    }
+
+    return true;
+}
+
+static bool extract_png_from_ico(const std::vector<char>& ico_bytes, std::vector<char>& out_png_bytes) {
+    auto read_u16 = [&](size_t offset) -> uint16_t {
+        if (offset + 2 > ico_bytes.size()) {
+            return 0;
+        }
+        return static_cast<uint16_t>(static_cast<uint8_t>(ico_bytes[offset])) |
+               (static_cast<uint16_t>(static_cast<uint8_t>(ico_bytes[offset + 1])) << 8);
+    };
+
+    auto read_u32 = [&](size_t offset) -> uint32_t {
+        if (offset + 4 > ico_bytes.size()) {
+            return 0;
+        }
+        return static_cast<uint32_t>(static_cast<uint8_t>(ico_bytes[offset])) |
+               (static_cast<uint32_t>(static_cast<uint8_t>(ico_bytes[offset + 1])) << 8) |
+               (static_cast<uint32_t>(static_cast<uint8_t>(ico_bytes[offset + 2])) << 16) |
+               (static_cast<uint32_t>(static_cast<uint8_t>(ico_bytes[offset + 3])) << 24);
+    };
+
+    if (ico_bytes.size() < 6) {
+        return false;
+    }
+
+    const uint16_t reserved = read_u16(0);
+    const uint16_t type = read_u16(2);
+    const uint16_t count = read_u16(4);
+
+    if (reserved != 0 || type != 1 || count == 0) {
+        return false;
+    }
+
+    const size_t entries_offset = 6;
+    const size_t entry_size = 16;
+    if (entries_offset + entry_size * static_cast<size_t>(count) > ico_bytes.size()) {
+        return false;
+    }
+
+    // Prefer the largest entry (typically 256x256). Note: width/height of 0 means 256.
+    size_t best_entry_offset = 0;
+    uint32_t best_area = 0;
+
+    for (uint16_t i = 0; i < count; i++) {
+        const size_t eoff = entries_offset + entry_size * static_cast<size_t>(i);
+        const uint8_t w = static_cast<uint8_t>(ico_bytes[eoff + 0]);
+        const uint8_t h = static_cast<uint8_t>(ico_bytes[eoff + 1]);
+        const uint32_t width = (w == 0) ? 256u : static_cast<uint32_t>(w);
+        const uint32_t height = (h == 0) ? 256u : static_cast<uint32_t>(h);
+        const uint32_t area = width * height;
+        const uint32_t bytes_in_res = read_u32(eoff + 8);
+        const uint32_t image_offset = read_u32(eoff + 12);
+
+        if (bytes_in_res == 0) {
+            continue;
+        }
+        if (static_cast<uint64_t>(image_offset) + static_cast<uint64_t>(bytes_in_res) > ico_bytes.size()) {
+            continue;
+        }
+
+        if (area > best_area) {
+            best_area = area;
+            best_entry_offset = eoff;
+        }
+    }
+
+    if (best_area == 0) {
+        return false;
+    }
+
+    const uint32_t bytes_in_res = read_u32(best_entry_offset + 8);
+    const uint32_t image_offset = read_u32(best_entry_offset + 12);
+
+    if (static_cast<uint64_t>(image_offset) + static_cast<uint64_t>(bytes_in_res) > ico_bytes.size()) {
+        return false;
+    }
+
+    const char png_magic[] = { '\x89', 'P', 'N', 'G', '\r', '\n', '\x1a', '\n' };
+    if (bytes_in_res < sizeof(png_magic)) {
+        return false;
+    }
+
+    if (memcmp(ico_bytes.data() + image_offset, png_magic, sizeof(png_magic)) != 0) {
+        // This ICO entry is not PNG-compressed (likely DIB). We currently only support PNG entries here.
+        return false;
+    }
+
+    out_png_bytes.assign(ico_bytes.begin() + image_offset, ico_bytes.begin() + image_offset + bytes_in_res);
+    return true;
+}
+
+static bool ensure_prompt_icon_queued() {
+    static bool queued = false;
+    static bool available = false;
+    if (queued) {
+        return available;
+    }
+
+    queued = true;
+
+    std::vector<char> bytes;
+    // Use the 256.ico file as the source, extracting the embedded PNG image.
+    const std::filesystem::path icon_ico_path = std::filesystem::path("icons") / "256.ico";
+    if (!try_read_file_bytes(icon_ico_path, bytes)) {
+        available = false;
+        return available;
+    }
+
+    std::vector<char> extracted_png;
+    if (!extract_png_from_ico(bytes, extracted_png)) {
+        available = false;
+        return available;
+    }
+
+    recompui::queue_image_from_bytes_file(prompt_icon_src, extracted_png);
+    available = true;
+    return available;
+}
+
+static void update_prompt_progress_locked(int completed, int total) {
+    total = std::clamp(total, 0, (int)prompt_state.prompt_progress_icons.size());
+    completed = std::clamp(completed, 0, total);
+
+    if (total <= 1) {
+        prompt_state.prompt_progress_container->set_display(recompui::Display::None);
+        return;
+    }
+
+    prompt_state.prompt_progress_container->set_display(recompui::Display::Flex);
+    // Hide the single icon when showing per-player icon count.
+    prompt_state.prompt_icon->set_display(recompui::Display::None);
+
+    for (int i = 0; i < (int)prompt_state.prompt_progress_icons.size(); i++) {
+        auto* icon = prompt_state.prompt_progress_icons[(size_t)i];
+        icon->set_display(i < completed ? recompui::Display::Block : recompui::Display::None);
+    }
+}
 
 void run_confirm_callback() {
     std::function<void()> confirm_action;
@@ -95,6 +264,32 @@ void recompui::init_prompt_context() {
     prompt_content->set_border_radius(16, Unit::Dp);
     prompt_content->set_border_color(Color{ 255, 255, 255, 51 });
     prompt_content->set_background_color(Color{ 8, 7, 13, 229 });
+
+    prompt_state.prompt_icon_available = ensure_prompt_icon_queued();
+    prompt_state.prompt_icon = context.create_element<Image>(prompt_content, prompt_icon_src);
+    prompt_state.prompt_icon->set_width(96, Unit::Dp);
+    prompt_state.prompt_icon->set_height(96, Unit::Dp);
+    prompt_state.prompt_icon->set_margin_top(24, Unit::Dp);
+    prompt_state.prompt_icon->set_margin_left_auto();
+    prompt_state.prompt_icon->set_margin_right_auto();
+    prompt_state.prompt_icon->set_display(Display::None);
+
+    prompt_state.prompt_progress_container = context.create_element<Element>(prompt_content);
+    prompt_state.prompt_progress_container->set_display(Display::None);
+    prompt_state.prompt_progress_container->set_flex_direction(FlexDirection::Row);
+    prompt_state.prompt_progress_container->set_justify_content(JustifyContent::Center);
+    prompt_state.prompt_progress_container->set_gap(10, Unit::Dp);
+    prompt_state.prompt_progress_container->set_margin_top(12, Unit::Dp);
+    prompt_state.prompt_progress_container->set_margin_left_auto();
+    prompt_state.prompt_progress_container->set_margin_right_auto();
+
+    for (size_t i = 0; i < prompt_state.prompt_progress_icons.size(); i++) {
+        auto* icon = context.create_element<Image>(prompt_state.prompt_progress_container, prompt_icon_src);
+        icon->set_width(64, Unit::Dp);
+        icon->set_height(64, Unit::Dp);
+        icon->set_display(Display::None);
+        prompt_state.prompt_progress_icons[i] = icon;
+    }
     
     prompt_state.prompt_header = context.create_element<Label>(prompt_content, "", LabelStyle::Large);
     prompt_state.prompt_header->set_margin(24, Unit::Dp);
@@ -252,6 +447,8 @@ void recompui::open_choice_prompt(
 
     prompt_state.prompt_header->set_text(header_text);
     prompt_state.prompt_label->set_text(content_text);
+    prompt_state.prompt_icon->set_display(Display::None);
+    prompt_state.prompt_progress_container->set_display(Display::None);
     prompt_state.prompt_controls->set_display(Display::Flex);
     prompt_state.confirm_button->set_display(Display::Block);
     prompt_state.cancel_button->set_display(Display::Block);
@@ -291,6 +488,8 @@ void recompui::open_info_prompt(
 
     prompt_state.prompt_header->set_text(header_text);
     prompt_state.prompt_label->set_text(content_text);
+    prompt_state.prompt_icon->set_display(Display::None);
+    prompt_state.prompt_progress_container->set_display(Display::None);
     prompt_state.prompt_controls->set_display(Display::Flex);
     prompt_state.confirm_button->set_display(Display::None);
     prompt_state.cancel_button->set_display(Display::Block);
@@ -325,6 +524,8 @@ void recompui::open_notification(
 
     prompt_state.prompt_header->set_text(header_text);
     prompt_state.prompt_label->set_text(content_text);
+    prompt_state.prompt_icon->set_display(prompt_state.prompt_icon_available ? Display::Block : Display::None);
+    prompt_state.prompt_progress_container->set_display(Display::None);
     prompt_state.prompt_controls->set_display(Display::None);
     prompt_state.confirm_button->set_display(Display::None);
     prompt_state.cancel_button->set_display(Display::None);
@@ -339,6 +540,21 @@ void recompui::open_notification(
     }
 
     show_prompt(prev_cancel_action, false);
+}
+
+void recompui::set_prompt_progress(int completed, int total) {
+    std::lock_guard lock{ prompt_state.mutex };
+    prompt_state.ui_context.open();
+    update_prompt_progress_locked(completed, total);
+    prompt_state.ui_context.close();
+}
+
+void recompui::clear_prompt_progress() {
+    std::lock_guard lock{ prompt_state.mutex };
+    prompt_state.ui_context.open();
+    prompt_state.prompt_progress_container->set_display(Display::None);
+    prompt_state.prompt_icon->set_display(prompt_state.prompt_icon_available ? Display::Block : Display::None);
+    prompt_state.ui_context.close();
 }
 
 void recompui::close_prompt() {

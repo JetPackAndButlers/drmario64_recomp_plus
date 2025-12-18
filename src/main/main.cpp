@@ -57,7 +57,7 @@
 
 #include "../../lib/rt64/src/contrib/stb/stb_image.h"
 
-const std::string version_string = "0.1.0";
+const std::string version_string = "1.0.0";
 
 template<typename... Ts>
 void exit_error(const char* str, Ts ...args) {
@@ -75,12 +75,20 @@ ultramodern::gfx_callbacks_t::gfx_data_t create_gfx() {
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    // Prevent Windows.Gaming.Input (WGI) from spamming "Access is denied" messages in the
+    // Visual Studio debug output window on some systems.
+    if (SDL_GetHint(SDL_HINT_JOYSTICK_WGI) == nullptr) {
+        SDL_SetHint(SDL_HINT_JOYSTICK_WGI, "0");
+    }
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) > 0) {
         exit_error("Failed to initialize SDL2: %s\n", SDL_GetError());
     }
 
     fprintf(stdout, "SDL Video Driver: %s\n", SDL_GetCurrentVideoDriver());
+
+    // Ensure controllers that were already connected at startup are detected and opened.
+    recomp::scan_controllers();
 
     return {};
 }
@@ -145,7 +153,7 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
     flags |= SDL_WINDOW_VULKAN;
 #endif
 
-    window = SDL_CreateWindow("Zelda 64: Recompiled", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1600, 960,  flags);
+    window = SDL_CreateWindow("Dr. Mario 64: Recompiled", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 960,  flags);
 #if defined(__linux__)
     SetImageAsIcon("icons/512.png",window);
     if (ultramodern::renderer::get_graphics_config().wm_option == ultramodern::renderer::WindowMode::Fullscreen) { // TODO: Remove once RT64 gets native fullscreen support on Linux
@@ -695,6 +703,9 @@ int main(int argc, char** argv) {
     // Register the .rtz texture pack file format with the previous content type as its only allowed content type.
     recomp::mods::register_mod_container_type("rtz", std::vector{ texture_pack_content_type_id }, false);
 
+
+    recomp::set_single_controller_mode(false);
+    
     recomp::start(
         project_version,
         {},

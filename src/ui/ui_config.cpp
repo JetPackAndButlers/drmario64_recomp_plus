@@ -9,6 +9,20 @@
 #include "ultramodern/config.hpp"
 #include "ultramodern/ultramodern.hpp"
 #include "RmlUi/Core.h"
+#include "core/ui_context.h"
+
+// ...existing code...
+#include "recomp_ui.h"
+#include "recomp_input.h"
+#include "zelda_sound.h"
+#include "zelda_config.h"
+#include "zelda_debug.h"
+#include "zelda_render.h"
+#include "zelda_support.h"
+#include "promptfont.h"
+#include "ultramodern/config.hpp"
+#include "ultramodern/ultramodern.hpp"
+#include "RmlUi/Core.h"
 
 #include "core/ui_context.h"
 
@@ -26,16 +40,15 @@ int recompui::config_tab_to_index(recompui::ConfigTab tab) {
     switch (tab) {
     case recompui::ConfigTab::General:
         return 0;
-    case recompui::ConfigTab::Controls:
-        return 1;
     case recompui::ConfigTab::Graphics:
-        return 2;
-    case recompui::ConfigTab::Sound:
-        return 3;
-    case recompui::ConfigTab::Mods:
-        return 4;
+        return 1;
     case recompui::ConfigTab::Debug:
-        return 5;
+        return 2;
+    // Tabs that are disabled/removed in this project.
+    case recompui::ConfigTab::Controls:
+    case recompui::ConfigTab::Sound:
+    case recompui::ConfigTab::Mods:
+        return -1;
     default:
         assert(false && "Unknown config tab.");
         return 0;
@@ -110,7 +123,8 @@ int recomp::get_scanned_input_index() {
 }
 
 void recomp::finish_scanning_input(recomp::InputField scanned_field) {
-    recomp::set_input_binding(static_cast<recomp::GameInput>(scanned_input_index), scanned_binding_index, cur_device, scanned_field);
+    // TODO: Needs the active controller tab.
+    recomp::set_input_binding(0, static_cast<recomp::GameInput>(scanned_input_index), scanned_binding_index, cur_device, scanned_field);
     scanned_input_index = -1;
     scanned_binding_index = -1;
     controls_model_handle.DirtyVariable("inputs");
@@ -240,6 +254,7 @@ struct ControlOptionsContext {
     zelda64::CameraInvertMode camera_invert_mode;
     zelda64::AnalogCamMode analog_cam_mode;
     zelda64::CameraInvertMode analog_camera_invert_mode;
+    zelda64::CrtScanlinesMode crt_scanlines_mode;
 };
 
 ControlOptionsContext control_options_context;
@@ -360,9 +375,24 @@ void zelda64::set_analog_camera_invert_mode(zelda64::CameraInvertMode mode) {
     }
 }
 
+zelda64::CrtScanlinesMode zelda64::get_crt_scanlines_mode() {
+    return control_options_context.crt_scanlines_mode;
+}
+
+void zelda64::set_crt_scanlines_mode(zelda64::CrtScanlinesMode mode) {
+    control_options_context.crt_scanlines_mode = mode;
+    if (general_model_handle) {
+        general_model_handle.DirtyVariable("crt_scanlines_mode");
+    }
+
+    zelda64::renderer::RT64SetCrtScanlinesEnabled(mode == zelda64::CrtScanlinesMode::On);
+}
+
 struct SoundOptionsContext {
     std::atomic<int> main_volume; // Option to control the volume of all sound
     std::atomic<int> bgm_volume;
+    std::atomic<int> sfx_volume;
+    std::atomic<int> env_volume;
     std::atomic<int> low_health_beeps_enabled; // RmlUi doesn't seem to like "true"/"false" strings for setting variants so an int is used here instead.
     void reset() {
         bgm_volume = 100;
@@ -375,6 +405,27 @@ struct SoundOptionsContext {
 };
 
 SoundOptionsContext sound_options_context;
+namespace zelda64 {
+void set_sfx_volume(int volume) {
+    sound_options_context.sfx_volume.store(volume);
+    if (sound_options_model_handle)
+        sound_options_model_handle.DirtyVariable("sfx_volume");
+}
+
+int get_sfx_volume() {
+    return sound_options_context.sfx_volume.load();
+}
+
+void set_env_volume(int volume) {
+    sound_options_context.env_volume.store(volume);
+    if (sound_options_model_handle)
+        sound_options_model_handle.DirtyVariable("env_volume");
+}
+
+int get_env_volume() {
+    return sound_options_context.env_volume.load();
+}
+}
 
 void zelda64::reset_sound_settings() {
     sound_options_context.reset();
@@ -472,7 +523,8 @@ class ConfigTabsetListener : public Rml::EventListener {
     void ProcessEvent(Rml::Event& event) override {
         if (event.GetId() == Rml::EventId::Tabchange) {
             int tab_index = event.GetParameter<int>("tab_index", 0);
-            bool in_mod_tab = (tab_index == recompui::config_tab_to_index(recompui::ConfigTab::Mods));
+            const int mod_tab_index = recompui::config_tab_to_index(recompui::ConfigTab::Mods);
+            bool in_mod_tab = (mod_tab_index >= 0) && (tab_index == mod_tab_index);
             if (in_mod_tab) {
                 recompui::set_config_tabset_mod_nav();
             }
@@ -493,6 +545,49 @@ class ConfigTabsetListener : public Rml::EventListener {
 class ConfigMenu : public recompui::MenuController {
 private:
     ConfigTabsetListener config_tabset_listener;
+
+    static void remove_tab_and_panel(Rml::ElementDocument* doc, const char* tab_id) {
+        if (doc == nullptr) {
+            return;
+        }
+
+        Rml::Element* tab = doc->GetElementById(tab_id);
+        if (tab == nullptr) {
+            return;
+        }
+
+        Rml::Element* parent = tab->GetParentNode();
+        if (parent == nullptr) {
+            return;
+        }
+
+        int tab_index = -1;
+        const int child_count = parent->GetNumChildren();
+        for (int i = 0; i < child_count; i++) {
+            if (parent->GetChild(i) == tab) {
+                tab_index = i;
+                break;
+            }
+        }
+
+        if (tab_index < 0) {
+            return;
+        }
+
+        // Panels live immediately after their tab in the tabset's children list.
+        Rml::Element* panel = nullptr;
+        if (tab_index + 1 < parent->GetNumChildren()) {
+            Rml::Element* next = parent->GetChild(tab_index + 1);
+            if (next != nullptr && next->GetTagName() == "panel") {
+                panel = next;
+            }
+        }
+
+        parent->RemoveChild(tab);
+        if (panel != nullptr) {
+            parent->RemoveChild(panel);
+        }
+    }
 public:
     ConfigMenu() {
 
@@ -502,6 +597,14 @@ public:
     }
     void load_document() override {
 		config_context = recompui::create_context(zelda64::get_asset_path("config_menu.rml"));
+
+        // This project doesn't expose Controls/Sound/Mods tabs; remove them from the tabset to avoid confusion and
+        // to make sure they don't appear even if assets are stale.
+        if (Rml::ElementDocument* doc = config_context.get_document()) {
+            remove_tab_and_panel(doc, "tab_controls");
+            remove_tab_and_panel(doc, "tab_mods");
+        }
+
         recompui::update_mod_list(false);
         recompui::get_config_tabset()->AddEventListener(Rml::EventId::Tabchange, &config_tabset_listener);
     }
@@ -633,11 +736,7 @@ public:
             });
         constructor.BindFunc("ds_option",
             [](Rml::Variant& out) {
-                if (new_options.res_option == ultramodern::renderer::Resolution::Auto) {
-                    out = 1;
-                } else {
-                    out = new_options.ds_option;
-                }
+                out = new_options.ds_option;
             },
             [](const Rml::Variant& in) {
                 new_options.ds_option = in.Get<int>();
@@ -658,9 +757,6 @@ public:
             [](Rml::Variant& out) {
                 switch (new_options.res_option) {
                     default:
-                    case ultramodern::renderer::Resolution::Auto:
-                        out = "Downsampling is not available at auto resolution";
-                        return;
                     case ultramodern::renderer::Resolution::Original:
                         if (new_options.ds_option == 2) {
                             out = "Rendered in 480p and scaled to 240p";
@@ -675,6 +771,13 @@ public:
                             out = "Rendered in 4K and scaled to 480p";
                         }
                         return;
+                    case ultramodern::renderer::Resolution::Original4x:
+                        if (new_options.ds_option == 2) {
+                            out = "Rendered in 4K and scaled to 960p";
+                        } else if (new_options.ds_option == 4) {
+                            out = "Rendered in 8K and scaled to 960p";
+                        }
+                        return;
                 }
                 out = "";
             });
@@ -682,12 +785,12 @@ public:
         constructor.BindFunc("gfx_help__apply", [](Rml::Variant& out) {
             if (cont_active) {
                 out = \
-                    (recomp::get_input_binding(recomp::GameInput::APPLY_MENU, 0, recomp::InputDevice::Controller).to_string() != "" ?
-                        " " + recomp::get_input_binding(recomp::GameInput::APPLY_MENU, 0, recomp::InputDevice::Controller).to_string() :
+                   (recomp::get_input_binding(0, recomp::GameInput::APPLY_MENU, 0, recomp::InputDevice::Controller).to_string() != "" ?
+                        " " + recomp::get_input_binding(0, recomp::GameInput::APPLY_MENU, 0, recomp::InputDevice::Controller).to_string() :
                         ""
                     ) + \
-                    (recomp::get_input_binding(recomp::GameInput::APPLY_MENU, 1, recomp::InputDevice::Controller).to_string() != "" ?
-                        " " + recomp::get_input_binding(recomp::GameInput::APPLY_MENU, 1, recomp::InputDevice::Controller).to_string() :
+                    (recomp::get_input_binding(0, recomp::GameInput::APPLY_MENU, 1, recomp::InputDevice::Controller).to_string() != "" ?
+                        " " + recomp::get_input_binding(0, recomp::GameInput::APPLY_MENU, 1, recomp::InputDevice::Controller).to_string() :
                         ""
                     );
             } else {
@@ -746,7 +849,8 @@ public:
             [](Rml::DataModelHandle model_handle, Rml::Event& event, const Rml::VariantList& inputs) {
                 recomp::GameInput input = static_cast<recomp::GameInput>(inputs.at(0).Get<size_t>());
                 for (size_t binding_index = 0; binding_index < recomp::bindings_per_input; binding_index++) {
-                    recomp::set_input_binding(input, binding_index, cur_device, recomp::InputField{});
+                                        // TODO: Needs the active controller tab.
+                    recomp::set_input_binding(0, input, binding_index, cur_device, recomp::InputField{});
                 }
                 model_handle.DirtyVariable("inputs");
                 graphics_model_handle.DirtyVariable("gfx_help__apply");
@@ -792,7 +896,8 @@ public:
             virtual int Size(void* ptr) override { return recomp::bindings_per_input; }
             virtual Rml::DataVariable Child(void* ptr, const Rml::DataAddressEntry& address) override {
                 recomp::GameInput input = static_cast<recomp::GameInput>((uintptr_t)ptr);
-                return Rml::DataVariable{&input_field_definition_instance, &recomp::get_input_binding(input, address.index, cur_device)};
+                                // TODO: Needs the active controller tab.
+                return Rml::DataVariable{&input_field_definition_instance, &recomp::get_input_binding(0, input, address.index, cur_device)};
             }
         };
         // Static instance of the InputField array variable definition to have a fixed pointer to return to RmlUi.
@@ -884,8 +989,8 @@ public:
         constructor.BindFunc("nav_help__accept", [](Rml::Variant& out) {
             if (cont_active) {
                 out = \
-                    recomp::get_input_binding(recomp::GameInput::ACCEPT_MENU, 0, recomp::InputDevice::Controller).to_string() + \
-                    recomp::get_input_binding(recomp::GameInput::ACCEPT_MENU, 1, recomp::InputDevice::Controller).to_string();
+                    recomp::get_input_binding(0, recomp::GameInput::ACCEPT_MENU, 0, recomp::InputDevice::Controller).to_string() + \
+                    recomp::get_input_binding(0, recomp::GameInput::ACCEPT_MENU, 1, recomp::InputDevice::Controller).to_string();
             } else {
                 out = PF_KEYBOARD_ENTER;
             }
@@ -894,8 +999,8 @@ public:
         constructor.BindFunc("nav_help__exit", [](Rml::Variant& out) {
             if (cont_active) {
                 out = \
-                    recomp::get_input_binding(recomp::GameInput::TOGGLE_MENU, 0, recomp::InputDevice::Controller).to_string() + \
-                    recomp::get_input_binding(recomp::GameInput::TOGGLE_MENU, 1, recomp::InputDevice::Controller).to_string();
+                    recomp::get_input_binding(0, recomp::GameInput::TOGGLE_MENU, 0, recomp::InputDevice::Controller).to_string() + \
+                    recomp::get_input_binding(0, recomp::GameInput::TOGGLE_MENU, 1, recomp::InputDevice::Controller).to_string();
             } else {
                 out = PF_KEYBOARD_ESCAPE;
             }
@@ -922,6 +1027,18 @@ public:
         bind_option(constructor, "camera_invert_mode", &control_options_context.camera_invert_mode);
         bind_option(constructor, "analog_cam_mode", &control_options_context.analog_cam_mode);
         bind_option(constructor, "analog_camera_invert_mode", &control_options_context.analog_camera_invert_mode);
+        constructor.BindFunc("crt_scanlines_mode",
+            [](Rml::Variant& out) { get_option(zelda64::get_crt_scanlines_mode(), out); },
+            [](const Rml::Variant& in) {
+                zelda64::CrtScanlinesMode mode = zelda64::CrtScanlinesMode::OptionCount;
+                from_json(in.Get<std::string>(), mode);
+                if (mode == zelda64::CrtScanlinesMode::OptionCount) {
+                    throw std::runtime_error("Invalid value :" + in.Get<std::string>());
+                }
+
+                zelda64::set_crt_scanlines_mode(mode);
+            }
+        );
 
         general_model_handle = constructor.GetModelHandle();
     }
@@ -937,8 +1054,6 @@ public:
         sound_options_model_handle = constructor.GetModelHandle();
 
         bind_atomic(constructor, sound_options_model_handle, "main_volume", &sound_options_context.main_volume);
-        bind_atomic(constructor, sound_options_model_handle, "bgm_volume", &sound_options_context.bgm_volume);
-        bind_atomic(constructor, sound_options_model_handle, "low_health_beeps_enabled", &sound_options_context.low_health_beeps_enabled);
     }
 
     void make_debug_bindings(Rml::Context* context) {
@@ -1017,7 +1132,11 @@ void recompui::toggle_fullscreen() {
 }
 
 void recompui::set_config_tab(ConfigTab tab) {
-    get_config_tabset()->SetActiveTab(config_tab_to_index(tab));
+    int tab_index = config_tab_to_index(tab);
+    if (tab_index < 0) {
+        tab_index = config_tab_to_index(ConfigTab::General);
+    }
+    get_config_tabset()->SetActiveTab(tab_index);
 }
 
 Rml::ElementTabSet* recompui::get_config_tabset() {
@@ -1047,10 +1166,14 @@ Rml::Element* recompui::get_mod_tab() {
     ContextId old_context = recompui::try_close_current_context();
 
     Rml::ElementDocument* doc = config_context.get_document();
-    assert(doc != nullptr);
+    if (doc == nullptr) {
+        if (old_context != ContextId::null()) {
+            old_context.open();
+        }
+        return nullptr;
+    }
 
     Rml::Element* tab_el = doc->GetElementById("tab_mods");
-    assert(tab_el != nullptr);
 
     if (old_context != ContextId::null()) {
         old_context.open();

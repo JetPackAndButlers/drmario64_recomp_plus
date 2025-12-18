@@ -1,5 +1,7 @@
 #include <atomic>
 #include <mutex>
+#include <functional>
+#include <unordered_set>
 
 #include "ultramodern/ultramodern.hpp"
 #include "recomp.h"
@@ -28,9 +30,12 @@ static struct {
     SDL_Keymod keymod = SDL_Keymod::KMOD_NONE;
     int numkeys = 0;
     std::atomic_int32_t mouse_wheel_pos = 0;
-    std::mutex cur_controllers_mutex;
-    std::vector<SDL_GameController*> cur_controllers{};
+    std::mutex controllers_mutex;
+    std::vector<SDL_GameController*> detected_controllers{};
+    std::vector<recomp::ControllerOption> detected_controller_options{};
+    std::array<SDL_GameController*, 4> assigned_controllers{}; // Only used when Multiplayer is enabled.
     std::unordered_map<SDL_JoystickID, ControllerState> controller_states;
+    bool single_controller = true;
     
     std::array<float, 2> rotation_delta{};
     std::array<float, 2> mouse_delta{};
@@ -38,9 +43,21 @@ static struct {
     std::array<float, 2> pending_rotation_delta{};
     std::array<float, 2> pending_mouse_delta{};
 
-    float cur_rumble;
-    bool rumble_active;
+    std::array<float, 4> cur_rumble{};
+    std::array<bool, 4> rumble_active{};
 } InputState;
+
+static struct {
+    std::mutex mutex;
+    bool active = false;
+    int next_player = 0;
+    int prompt_player_count = 0;
+    int total_player_count = 0;
+    bool auto_assign_last_player = false;
+    std::unordered_set<SDL_JoystickID> assigned_instance_ids{};
+    std::function<void()> on_complete{};
+    std::function<void()> on_cancel{};
+} ControllerAssignState;
 
 static struct {
     std::list<std::filesystem::path> files_dropped;
@@ -89,6 +106,130 @@ void recompui::set_cursor_visible(bool visible) {
     cursor_enabled.store(visible);
 }
 
+static recomp::ControllerGUID make_guid_for_controller(SDL_GameController* controller) {
+    SDL_Joystick* joystick = SDL_GameControllerGetJoystick(controller);
+    if (joystick == nullptr) {
+        return {};
+    }
+
+    Uint16 vendor, product, version, crc16;
+    SDL_JoystickGUID joystick_guid = SDL_JoystickGetGUID(joystick);
+    const char* joystick_serial = SDL_JoystickGetSerial(joystick);
+    SDL_GetJoystickGUIDInfo(joystick_guid, &vendor, &product, &version, &crc16);
+
+    return recomp::ControllerGUID{
+        .serial = joystick_serial != nullptr ? std::string(joystick_serial) : std::string{},
+        .vendor = vendor,
+        .product = product,
+        .version = version,
+        .crc16 = crc16,
+        .player_index = SDL_JoystickGetPlayerIndex(joystick),
+    };
+}
+
+static void show_controller_assignment_prompt_locked() {
+    const int player_num = ControllerAssignState.next_player + 1;
+    recompui::open_notification(
+        "Assign Controllers",
+        "Player " + std::to_string(player_num) + ": Press any button on the controller you want to use.\n\n"
+        "Press Esc to skip and keep the current ordering."
+    );
+    // Show N icons where N == current player index (1-based).
+    recompui::set_prompt_progress(ControllerAssignState.next_player + 1, ControllerAssignState.total_player_count);
+}
+
+static bool try_handle_controller_assignment(SDL_JoystickID instance_id) {
+    std::function<void()> on_complete{};
+
+    {
+        std::lock_guard lock{ ControllerAssignState.mutex };
+        if (!ControllerAssignState.active) {
+            return false;
+        }
+
+        if (ControllerAssignState.assigned_instance_ids.contains(instance_id)) {
+            return true;
+        }
+
+        SDL_GameController* controller = nullptr;
+        {
+            std::lock_guard input_lock{ InputState.controllers_mutex };
+            auto it = InputState.controller_states.find(instance_id);
+            if (it != InputState.controller_states.end()) {
+                controller = it->second.controller;
+            }
+        }
+
+        if (controller == nullptr) {
+            return true;
+        }
+
+        recomp::set_input_controller_guid(ControllerAssignState.next_player, make_guid_for_controller(controller));
+        ControllerAssignState.assigned_instance_ids.insert(instance_id);
+        ControllerAssignState.next_player++;
+
+        // Apply updated GUIDs to slot assignment immediately.
+        recomp::poll_inputs();
+
+        const bool done_with_prompts = (ControllerAssignState.next_player >= ControllerAssignState.prompt_player_count);
+        if (done_with_prompts) {
+            if (ControllerAssignState.auto_assign_last_player) {
+                // Exactly 4 controllers case: auto-assign the remaining unassigned controller to player 4.
+                SDL_GameController* remaining_controller = nullptr;
+                SDL_JoystickID remaining_instance_id = 0;
+                {
+                    std::lock_guard input_lock{ InputState.controllers_mutex };
+                    for (const auto& [id, state] : InputState.controller_states) {
+                        if (state.controller == nullptr) {
+                            continue;
+                        }
+                        if (!ControllerAssignState.assigned_instance_ids.contains(id)) {
+                            if (remaining_controller != nullptr) {
+                                // More than one remaining; fall back to prompting player 4.
+                                remaining_controller = nullptr;
+                                break;
+                            }
+                            remaining_controller = state.controller;
+                            remaining_instance_id = id;
+                        }
+                    }
+                }
+
+                if (remaining_controller != nullptr) {
+                    recomp::set_input_controller_guid(3, make_guid_for_controller(remaining_controller));
+                    ControllerAssignState.assigned_instance_ids.insert(remaining_instance_id);
+                    recomp::poll_inputs();
+                    recompui::set_prompt_progress(4, 4);
+
+                    ControllerAssignState.active = false;
+                    on_complete = std::move(ControllerAssignState.on_complete);
+                }
+                else {
+                    // Could not auto-assign uniquely; prompt player 4 instead.
+                    ControllerAssignState.auto_assign_last_player = false;
+                    ControllerAssignState.prompt_player_count = 4;
+                    show_controller_assignment_prompt_locked();
+                }
+            }
+            else {
+                ControllerAssignState.active = false;
+                on_complete = std::move(ControllerAssignState.on_complete);
+            }
+        }
+        else {
+            show_controller_assignment_prompt_locked();
+        }
+    }
+
+    if (on_complete) {
+        recompui::close_prompt();
+        recompui::clear_prompt_progress();
+        on_complete();
+    }
+
+    return true;
+}
+
 bool should_override_keystate(SDL_Scancode key, SDL_Keymod mod) {
     // Override Enter when Alt is held.
     if (key == SDL_Scancode::SDL_SCANCODE_RETURN) {
@@ -105,6 +246,12 @@ bool sdl_event_filter(void* userdata, SDL_Event* event) {
     case SDL_EventType::SDL_KEYDOWN:
         {
             SDL_KeyboardEvent* keyevent = &event->key;
+
+            if (recomp::is_controller_assignment_active() &&
+                keyevent->keysym.scancode == SDL_Scancode::SDL_SCANCODE_ESCAPE) {
+                recomp::cancel_controller_assignment();
+                break;
+            }
 
             // Skip repeated events when not in the menu
             if (!recompui::is_context_capturing_input() &&
@@ -133,25 +280,22 @@ bool sdl_event_filter(void* userdata, SDL_Event* event) {
     case SDL_EventType::SDL_CONTROLLERDEVICEADDED:
         {
             SDL_ControllerDeviceEvent* controller_event = &event->cdevice;
-            SDL_GameController* controller = SDL_GameControllerOpen(controller_event->which);
-            printf("Controller added: %d\n", controller_event->which);
-            if (controller != nullptr) {
-                printf("  Instance ID: %d\n", SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller)));
-                ControllerState& state = InputState.controller_states[SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller))];
-                state.controller = controller;
-
-                if (SDL_GameControllerHasSensor(controller, SDL_SensorType::SDL_SENSOR_GYRO) && SDL_GameControllerHasSensor(controller, SDL_SensorType::SDL_SENSOR_ACCEL)) {
-                    SDL_GameControllerSetSensorEnabled(controller, SDL_SensorType::SDL_SENSOR_GYRO, SDL_TRUE);
-                    SDL_GameControllerSetSensorEnabled(controller, SDL_SensorType::SDL_SENSOR_ACCEL, SDL_TRUE);
-                }
-            }
+            (void)controller_event; // Device index is handled by scan_controllers.
+            recomp::scan_controllers();
         }
         break;
     case SDL_EventType::SDL_CONTROLLERDEVICEREMOVED:
         {
             SDL_ControllerDeviceEvent* controller_event = &event->cdevice;
-            printf("Controller removed: %d\n", controller_event->which);
-            InputState.controller_states.erase(controller_event->which);
+            // 'which' is a joystick instance id for REMOVED.
+            std::lock_guard lock{ InputState.controllers_mutex };
+            auto it = InputState.controller_states.find(controller_event->which);
+            if (it != InputState.controller_states.end()) {
+                if (it->second.controller != nullptr) {
+                    SDL_GameControllerClose(it->second.controller);
+                }
+                InputState.controller_states.erase(it);
+            }
         }
         break;
     case SDL_EventType::SDL_QUIT: {
@@ -160,7 +304,8 @@ bool sdl_event_filter(void* userdata, SDL_Event* event) {
             return true;
         }
 
-        zelda64::open_quit_game_prompt();
+        // zelda64::open_quit_game_prompt();
+        ultramodern::quit();
         recompui::activate_mouse();
         break;
     }
@@ -172,9 +317,14 @@ bool sdl_event_filter(void* userdata, SDL_Event* event) {
         queue_if_enabled(event);
         break;
     case SDL_EventType::SDL_CONTROLLERBUTTONDOWN:
+        if (recomp::is_controller_assignment_active()) {
+            (void)try_handle_controller_assignment(event->cbutton.which);
+            break;
+        }
         if (scanning_device != recomp::InputDevice::COUNT) {
-            auto menuToggleBinding0 = recomp::get_input_binding(recomp::GameInput::TOGGLE_MENU, 0, recomp::InputDevice::Controller);
-            auto menuToggleBinding1 = recomp::get_input_binding(recomp::GameInput::TOGGLE_MENU, 1, recomp::InputDevice::Controller);
+            // TODO: Needs the active controller tab index.
+            auto menuToggleBinding0 = recomp::get_input_binding(0, recomp::GameInput::TOGGLE_MENU, 0, recomp::InputDevice::Controller);
+            auto menuToggleBinding1 = recomp::get_input_binding(0, recomp::GameInput::TOGGLE_MENU, 1, recomp::InputDevice::Controller);
             // note - magic number: 0 is InputType::None
             if ((menuToggleBinding0.input_type != 0 && event->cbutton.button == menuToggleBinding0.input_id) ||
                 (menuToggleBinding1.input_type != 0 && event->cbutton.button == menuToggleBinding1.input_id)) {
@@ -324,6 +474,110 @@ void recomp::handle_events() {
     }
 }
 
+static void open_controller_device_index(int device_index) {
+    if (device_index < 0 || device_index >= SDL_NumJoysticks()) {
+        return;
+    }
+
+    if (!SDL_IsGameController(device_index)) {
+        return;
+    }
+
+    SDL_GameController* controller = SDL_GameControllerOpen(device_index);
+    if (controller == nullptr) {
+        return;
+    }
+
+    SDL_Joystick* joystick = SDL_GameControllerGetJoystick(controller);
+    if (joystick == nullptr) {
+        SDL_GameControllerClose(controller);
+        return;
+    }
+
+    const SDL_JoystickID instance_id = SDL_JoystickInstanceID(joystick);
+
+    {
+        std::lock_guard lock{ InputState.controllers_mutex };
+        auto [it, inserted] = InputState.controller_states.emplace(instance_id, ControllerState{});
+        if (!inserted && it->second.controller != nullptr) {
+            // Already opened.
+            SDL_GameControllerClose(controller);
+            return;
+        }
+        it->second.controller = controller;
+    }
+
+    if (SDL_GameControllerHasSensor(controller, SDL_SensorType::SDL_SENSOR_GYRO) &&
+        SDL_GameControllerHasSensor(controller, SDL_SensorType::SDL_SENSOR_ACCEL)) {
+        SDL_GameControllerSetSensorEnabled(controller, SDL_SensorType::SDL_SENSOR_GYRO, SDL_TRUE);
+        SDL_GameControllerSetSensorEnabled(controller, SDL_SensorType::SDL_SENSOR_ACCEL, SDL_TRUE);
+    }
+}
+
+void recomp::scan_controllers() {
+    // Ensure SDL internal device state is up to date before enumerating.
+    SDL_PumpEvents();
+
+    const int joystick_count = SDL_NumJoysticks();
+    for (int device_index = 0; device_index < joystick_count; device_index++) {
+        open_controller_device_index(device_index);
+    }
+
+    // Refresh assignments based on current devices + config.
+    recomp::poll_inputs();
+}
+
+void recomp::begin_controller_assignment(int detected_controller_count, std::function<void()> on_complete, std::function<void()> on_cancel) {
+    detected_controller_count = std::max(detected_controller_count, 0);
+    if (detected_controller_count <= 1) {
+        if (on_complete) {
+            on_complete();
+        }
+        return;
+    }
+
+    std::lock_guard lock{ ControllerAssignState.mutex };
+    ControllerAssignState.active = true;
+    ControllerAssignState.next_player = 0;
+    ControllerAssignState.auto_assign_last_player = (detected_controller_count == 4);
+    ControllerAssignState.total_player_count = std::min(4, detected_controller_count);
+    ControllerAssignState.prompt_player_count = ControllerAssignState.total_player_count;
+    if (ControllerAssignState.auto_assign_last_player) {
+        // Auto-assign player 4; only prompt players 1..3.
+        ControllerAssignState.prompt_player_count = 3;
+    }
+    ControllerAssignState.assigned_instance_ids.clear();
+    ControllerAssignState.on_complete = std::move(on_complete);
+    ControllerAssignState.on_cancel = std::move(on_cancel);
+
+    show_controller_assignment_prompt_locked();
+}
+
+void recomp::cancel_controller_assignment() {
+    std::function<void()> on_cancel{};
+    {
+        std::lock_guard lock{ ControllerAssignState.mutex };
+        if (!ControllerAssignState.active) {
+            return;
+        }
+        ControllerAssignState.active = false;
+        on_cancel = std::move(ControllerAssignState.on_cancel);
+        ControllerAssignState.on_complete = {};
+        ControllerAssignState.assigned_instance_ids.clear();
+    }
+
+    recompui::close_prompt();
+    recompui::clear_prompt_progress();
+    if (on_cancel) {
+        on_cancel();
+    }
+}
+
+bool recomp::is_controller_assignment_active() {
+    std::lock_guard lock{ ControllerAssignState.mutex };
+    return ControllerAssignState.active;
+}
+
 constexpr SDL_GameControllerButton SDL_CONTROLLER_BUTTON_SOUTH = SDL_CONTROLLER_BUTTON_A;
 constexpr SDL_GameControllerButton SDL_CONTROLLER_BUTTON_EAST = SDL_CONTROLLER_BUTTON_B;
 constexpr SDL_GameControllerButton SDL_CONTROLLER_BUTTON_WEST = SDL_CONTROLLER_BUTTON_X;
@@ -406,7 +660,7 @@ const recomp::DefaultN64Mappings recomp::default_n64_controller_mappings = {
         {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_LEFTSHOULDER},
     },
     .r = {
-        {.input_type = (uint32_t)InputType::ControllerAnalog, .input_id = SDL_CONTROLLER_AXIS_TRIGGERRIGHT + 1},
+        {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_RIGHTSHOULDER},
     },
     .z = {
         {.input_type = (uint32_t)InputType::ControllerAnalog, .input_id = SDL_CONTROLLER_AXIS_TRIGGERLEFT + 1},
@@ -428,7 +682,6 @@ const recomp::DefaultN64Mappings recomp::default_n64_controller_mappings = {
     },
     .c_down = {
         {.input_type = (uint32_t)InputType::ControllerAnalog, .input_id = SDL_CONTROLLER_AXIS_RIGHTY + 1},
-        {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_RIGHTSHOULDER},
     },
     .dpad_left = {
         {.input_type = (uint32_t)InputType::ControllerDigital, .input_id = SDL_CONTROLLER_BUTTON_DPAD_LEFT},
@@ -471,14 +724,75 @@ void recomp::poll_inputs() {
     InputState.keymod = SDL_GetModState();
 
     {
-        std::lock_guard lock{ InputState.cur_controllers_mutex };
-        InputState.cur_controllers.clear();
+        std::lock_guard lock{ InputState.controllers_mutex };
+        InputState.detected_controllers.clear();
+
+        static std::vector<size_t> free_controllers;
+        free_controllers.clear();
 
         for (const auto& [id, state] : InputState.controller_states) {
-            (void)id; // Avoid unused variable warning.
+            (void) id; // Avoid unused variable warning.
             SDL_GameController* controller = state.controller;
             if (controller != nullptr) {
-                InputState.cur_controllers.push_back(controller);
+                free_controllers.emplace_back(InputState.detected_controllers.size());
+                InputState.detected_controllers.push_back(controller);
+            }
+        }
+
+        // Assign controllers based on configuration.
+        InputState.assigned_controllers.fill(nullptr);
+
+        // FIXME: Use active player count instead of iterating on all possible players.
+        Uint16 vendor, product, version, crc16;
+        for (size_t i = 0; i < 4; i++) {
+            recomp::ControllerGUID controller_guid = recomp::get_input_controller_guid(i);
+            int min_index_difference = INT_MAX;
+            size_t j = 0;
+            while (j < free_controllers.size()) {
+                SDL_GameController* controller = InputState.detected_controllers[free_controllers[j]];
+                SDL_Joystick* joystick = SDL_GameControllerGetJoystick(controller);
+                if (joystick != nullptr) {
+                    SDL_JoystickGUID joystick_guid = SDL_JoystickGetGUID(joystick);
+                    const char* joystick_serial = SDL_JoystickGetSerial(joystick);
+                    SDL_GetJoystickGUIDInfo(joystick_guid, &vendor, &product, &version, &crc16);
+
+                    bool empty_serials = controller_guid.serial.empty() && joystick_serial == nullptr;
+                    bool matching_serials =
+                        joystick_serial != nullptr && strcmp(joystick_serial, controller_guid.serial.c_str()) == 0;
+                    if (vendor == controller_guid.vendor && product == controller_guid.product &&
+                        version == controller_guid.version && crc16 == controller_guid.crc16 &&
+                        (empty_serials || matching_serials)) {
+                        // The controller seems to be a match, but we use the controller with the least difference in
+                        // player index to sort out potential duplicates.
+                        int joystick_player_index = SDL_JoystickGetPlayerIndex(joystick);
+                        int index_difference = abs(controller_guid.player_index - joystick_player_index);
+                        if (min_index_difference > index_difference) {
+                            InputState.assigned_controllers[i] = controller;
+                            min_index_difference = index_difference;
+                            free_controllers.erase(free_controllers.begin() + j);
+                            continue;
+                        }
+                    }
+                }
+
+                j++;
+            }
+        }
+
+        // Do a second pass to assign controllers that are currently unused to the remaining players that failed to be
+        // assigned a controller.
+        for (int i = 0; i < 4; i++) {
+            if (InputState.assigned_controllers[i] != nullptr) {
+                continue;
+            }
+
+            if (!free_controllers.empty()) {
+                // Assign a free controller only.
+                InputState.assigned_controllers[i] = InputState.detected_controllers[free_controllers.front()];
+                free_controllers.erase(free_controllers.begin());
+            } else {
+                // Prefer not to assign a controller if none of them are free.
+                break;
             }
         }
     }
@@ -514,24 +828,51 @@ void recomp::poll_inputs() {
 }
 
 void recomp::set_rumble(int controller_num, bool on) {
-    if (controller_num == 0) {
-        InputState.rumble_active = on;
-    }
+    InputState.rumble_active[controller_num] = on;
 }
 
 ultramodern::input::connected_device_info_t recomp::get_connected_device_info(int controller_num) {
-    switch (controller_num) {
-        case 0:
-            return ultramodern::input::connected_device_info_t {
-                .connected_device = ultramodern::input::Device::Controller,
-                .connected_pak = ultramodern::input::Pak::RumblePak,
-            };
-    }
+    const bool present = recomp::n64_controller_present(controller_num);
 
-    return ultramodern::input::connected_device_info_t {
-        .connected_device = ultramodern::input::Device::None,
+    ultramodern::input::connected_device_info_t info{
+        .connected_device = present ? ultramodern::input::Device::Controller : ultramodern::input::Device::None,
         .connected_pak = ultramodern::input::Pak::None,
     };
+
+    if (!present) {
+        return info;
+    }
+
+    // Only report a Rumble Pak when there is a physical controller assigned/available for that slot.
+    std::lock_guard lock{ InputState.controllers_mutex };
+    if (InputState.single_controller) {
+        info.connected_pak = InputState.detected_controllers.empty() ? ultramodern::input::Pak::None : ultramodern::input::Pak::RumblePak;
+    } else {
+        info.connected_pak = (controller_num >= 0 && controller_num < (int)InputState.assigned_controllers.size() &&
+                              InputState.assigned_controllers[controller_num] != nullptr)
+                                 ? ultramodern::input::Pak::RumblePak
+                                 : ultramodern::input::Pak::None;
+    }
+
+    return info;
+}
+
+bool recomp::n64_controller_present(int controller_num) {
+    // Treat controller 1 as always present so keyboard-only play works.
+    if (controller_num == 0) {
+        return true;
+    }
+
+    if (controller_num < 0 || controller_num >= 4) {
+        return false;
+    }
+
+    std::lock_guard lock{ InputState.controllers_mutex };
+    if (InputState.single_controller) {
+        return false;
+    }
+
+    return InputState.assigned_controllers[controller_num] != nullptr;
 }
 
 static float smoothstep(float from, float to, float amount) {
@@ -541,35 +882,52 @@ static float smoothstep(float from, float to, float amount) {
 
 // Update rumble to attempt to mimic the way n64 rumble ramps up and falls off
 void recomp::update_rumble() {
-    // Note: values are not accurate! just approximations based on feel
-    if (InputState.rumble_active) {
-        InputState.cur_rumble += 0.17f;
-        if (InputState.cur_rumble > 1) InputState.cur_rumble = 1;
-    } else {
-        InputState.cur_rumble *= 0.92f;
-        InputState.cur_rumble -= 0.01f;
-        if (InputState.cur_rumble < 0) InputState.cur_rumble = 0;
-    }
-    float smooth_rumble = smoothstep(0, 1, InputState.cur_rumble);
-
-    uint16_t rumble_strength = smooth_rumble * (recomp::get_rumble_strength() * 0xFFFF / 100);
-    uint32_t duration = 1000000; // Dummy duration value that lasts long enough to matter as the game will reset rumble on its own.
-    {
-        std::lock_guard lock{ InputState.cur_controllers_mutex };
-        for (const auto& controller : InputState.cur_controllers) {
-            SDL_GameControllerRumble(controller, 0, rumble_strength, duration);
+    for (size_t i = 0; i < InputState.cur_rumble.size(); i++) {
+        // Note: values are not accurate! just approximations based on feel
+        if (InputState.rumble_active[i]) {
+            InputState.cur_rumble[i] += 0.17f;
+            if (InputState.cur_rumble[i] > 1) InputState.cur_rumble[i] = 1;
         }
-    }
-}
+        else {
+            InputState.cur_rumble[i] *= 0.92f;
+            InputState.cur_rumble[i] -= 0.01f;
+            if (InputState.cur_rumble[i] < 0) InputState.cur_rumble[i] = 0;
+        }
+        float smooth_rumble = smoothstep(0, 1, InputState.cur_rumble[i]);
+ 
+        uint16_t rumble_strength = smooth_rumble * (recomp::get_rumble_strength() * 0xFFFF / 100);
+        uint32_t duration = 1000000; // Dummy duration value that lasts long enough to matter as the game will reset rumble on its own.
+        {
+            std::lock_guard lock{ InputState.controllers_mutex };
+            if (InputState.single_controller) {
+                for (const auto &controller : InputState.detected_controllers) {
+                    SDL_GameControllerRumble(controller, 0, rumble_strength, duration);
+                }
+            }
+            else {
+                if (InputState.assigned_controllers[i] != nullptr) {
+                    SDL_GameControllerRumble(InputState.assigned_controllers[i], 0, rumble_strength, duration);
+                }
+            }
+         }
+     }
+ }
 
-bool controller_button_state(int32_t input_id) {
+bool controller_button_state(int controller_num, int32_t input_id) {
     if (input_id >= 0 && input_id < SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_MAX) {
         SDL_GameControllerButton button = (SDL_GameControllerButton)input_id;
         bool ret = false;
         {
-            std::lock_guard lock{ InputState.cur_controllers_mutex };
-            for (const auto& controller : InputState.cur_controllers) {
-                ret |= SDL_GameControllerGetButton(controller, button);
+            std::lock_guard lock{ InputState.controllers_mutex };
+            if (InputState.single_controller) {
+                for (const auto &controller : InputState.detected_controllers) {
+                    ret |= SDL_GameControllerGetButton(controller, button);
+                }
+            }
+            else {
+                if (InputState.assigned_controllers[controller_num] != nullptr) {
+                    ret |= SDL_GameControllerGetButton(InputState.assigned_controllers[controller_num], button);
+                }
             }
         }
 
@@ -580,16 +938,15 @@ bool controller_button_state(int32_t input_id) {
 
 static std::atomic_bool right_analog_suppressed = false;
 
-float controller_axis_state(int32_t input_id, bool allow_suppression) {
+float controller_axis_state(int controller_num, int32_t input_id, bool allow_suppression) {
     if (abs(input_id) - 1 < SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_MAX) {
         SDL_GameControllerAxis axis = (SDL_GameControllerAxis)(abs(input_id) - 1);
         bool negative_range = input_id < 0;
         float ret = 0.0f;
 
         {
-            std::lock_guard lock{ InputState.cur_controllers_mutex };
-            for (const auto& controller : InputState.cur_controllers) {
-                float cur_val = SDL_GameControllerGetAxis(controller, axis) * (1/32768.0f);
+            auto gather_axis_state = [&](SDL_GameController* controller) {
+                float cur_val = SDL_GameControllerGetAxis(controller, axis) * (1 / 32768.0f);
                 if (negative_range) {
                     cur_val = -cur_val;
                 }
@@ -600,6 +957,18 @@ float controller_axis_state(int32_t input_id, bool allow_suppression) {
                     cur_val = 0;
                 }
                 ret += std::clamp(cur_val, 0.0f, 1.0f);
+            };
+
+            std::lock_guard lock{ InputState.controllers_mutex };
+            if (InputState.single_controller) {
+                for (SDL_GameController *controller : InputState.detected_controllers) {
+                    gather_axis_state(controller);
+                }
+            }
+            else {
+                if (InputState.assigned_controllers[controller_num] != nullptr) {
+                    gather_axis_state(InputState.assigned_controllers[controller_num]);
+                }
             }
         }
 
@@ -608,7 +977,7 @@ float controller_axis_state(int32_t input_id, bool allow_suppression) {
     return false;
 }
 
-float recomp::get_input_analog(const recomp::InputField& field) {
+float recomp::get_input_analog(int controller_num, const recomp::InputField& field) {
     switch ((InputType)field.input_type) {
     case InputType::Keyboard:
         if (InputState.keys && field.input_id >= 0 && field.input_id < InputState.numkeys) {
@@ -619,9 +988,9 @@ float recomp::get_input_analog(const recomp::InputField& field) {
         }
         return 0.0f;
     case InputType::ControllerDigital:
-        return controller_button_state(field.input_id) ? 1.0f : 0.0f;
+        return controller_button_state(controller_num, field.input_id) ? 1.0f : 0.0f;
     case InputType::ControllerAnalog:
-        return controller_axis_state(field.input_id, true);
+        return controller_axis_state(controller_num, field.input_id, true);
     case InputType::Mouse:
         // TODO mouse support
         return 0.0f;
@@ -630,15 +999,15 @@ float recomp::get_input_analog(const recomp::InputField& field) {
     }
 }
 
-float recomp::get_input_analog(const std::span<const recomp::InputField> fields) {
+float recomp::get_input_analog(int controller_num, const std::span<const recomp::InputField> fields) {
     float ret = 0.0f;
     for (const auto& field : fields) {
-        ret += get_input_analog(field);
+        ret += get_input_analog(controller_num, field);
     }
     return std::clamp(ret, 0.0f, 1.0f);
 }
 
-bool recomp::get_input_digital(const recomp::InputField& field) {
+bool recomp::get_input_digital(int controller_num, const recomp::InputField& field) {
     switch ((InputType)field.input_type) {
     case InputType::Keyboard:
         if (InputState.keys && field.input_id >= 0 && field.input_id < InputState.numkeys) {
@@ -649,10 +1018,10 @@ bool recomp::get_input_digital(const recomp::InputField& field) {
         }
         return false;
     case InputType::ControllerDigital:
-        return controller_button_state(field.input_id);
+        return controller_button_state(controller_num, field.input_id);
     case InputType::ControllerAnalog:
         // TODO adjustable threshold
-        return controller_axis_state(field.input_id, true) >= axis_threshold;
+        return controller_axis_state(controller_num, field.input_id, true) >= axis_threshold;
     case InputType::Mouse:
         // TODO mouse support
         return false;
@@ -661,10 +1030,10 @@ bool recomp::get_input_digital(const recomp::InputField& field) {
     }
 }
 
-bool recomp::get_input_digital(const std::span<const recomp::InputField> fields) {
+bool recomp::get_input_digital(int controller_num, const std::span<const recomp::InputField> fields) {
     bool ret = 0;
     for (const auto& field : fields) {
-        ret |= get_input_digital(field);
+        ret |= get_input_digital(controller_num, field);
     }
     return ret;
 }
@@ -718,13 +1087,13 @@ void recomp::apply_joystick_deadzone(float x_in, float y_in, float* x_out, float
     *y_out = y_in;
 }
 
-void recomp::get_right_analog(float* x, float* y) {
+void recomp::get_right_analog(int controller_num, float* x, float* y) {
     float x_val =
-        controller_axis_state((SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTX + 1), false) -
-        controller_axis_state(-(SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTX + 1), false);
+        controller_axis_state(controller_num, (SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTX + 1), false) -
+        controller_axis_state(controller_num, -(SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTX + 1), false);
     float y_val =
-        controller_axis_state((SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTY + 1), false) -
-        controller_axis_state(-(SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTY + 1), false);
+        controller_axis_state(controller_num, (SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTY + 1), false) -
+        controller_axis_state(controller_num, -(SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTY + 1), false);
     recomp::apply_joystick_deadzone(x_val, y_val, x, y);
 }
 
@@ -740,6 +1109,14 @@ bool recomp::game_input_disabled() {
 bool recomp::all_input_disabled() {
     // Disable all input if an input is being polled.
     return scanning_device != recomp::InputDevice::COUNT;
+}
+
+bool recomp::get_single_controller_mode() {
+    return InputState.single_controller;
+}
+
+void recomp::set_single_controller_mode(bool single_controller) {
+    InputState.single_controller = single_controller;
 }
 
 std::string controller_button_to_string(SDL_GameControllerButton button) {
@@ -906,4 +1283,38 @@ std::string recomp::InputField::to_string() const {
         default:
             return std::to_string(input_type) + "," + std::to_string(input_id);
     }
+}
+
+void recomp::refresh_controller_options() {
+    // TODO: Is it okay to use this to make sure the detected controllers are up to date here?
+    recomp::poll_inputs();
+
+    std::lock_guard lock{ InputState.controllers_mutex };
+    InputState.detected_controller_options.clear();
+    for (SDL_GameController* controller : InputState.detected_controllers) {
+        SDL_Joystick* joystick = SDL_GameControllerGetJoystick(controller);
+        if (joystick == nullptr) {
+            continue;
+        }
+
+        Uint16 vendor, product, version, crc16;
+        const char* joystick_name = SDL_JoystickName(joystick);
+        const char* joystick_serial = SDL_JoystickGetSerial(joystick);
+        std::string joystick_name_string = joystick_name != nullptr ? std::string(joystick_name) : "Unknown controller";
+        SDL_JoystickGUID joystick_guid = SDL_JoystickGetGUID(joystick);
+        int joystick_player_index = SDL_JoystickGetPlayerIndex(joystick);
+        SDL_GetJoystickGUIDInfo(joystick_guid, &vendor, &product, &version, &crc16);
+
+        ControllerGUID guid = { joystick_serial != nullptr ? std::string(joystick_serial) : std::string(),
+                                vendor,
+                                product,
+                                version,
+                                crc16,
+                                joystick_player_index };
+        InputState.detected_controller_options.emplace_back(ControllerOption{ joystick_name_string, guid });
+    }
+}
+
+const std::vector<recomp::ControllerOption>& recomp::get_controller_options() {
+    return InputState.detected_controller_options;
 }

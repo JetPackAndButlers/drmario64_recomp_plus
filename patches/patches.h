@@ -1,6 +1,20 @@
 #ifndef __PATCHES_H__
 #define __PATCHES_H__
 
+#include "PR/ultratypes.h"
+#include "PR/mbi.h"
+#include "PR/gbi.h"
+
+#define SCREEN_WIDTH  320
+#define SCREEN_HEIGHT 240
+
+struct TiTexData *dm_game_get_capsel_pal(s32 arg0, s32 arg1);
+extern Gfx *gGfxHead;
+extern Gfx normal_texture_init_dl[];
+struct TiTexData *dm_game_get_capsel_tex(s32 arg0);
+void load_TexTile_4b(const u8 texture[], s32 size_w, s32 size_h, s32 start_w, s32 start_h, s32 end_w, s32 end_h);
+void load_TexPal(const u16 tlut[]);
+
 // TODO fix renaming symbols in patch recompilation
 #define osCreateMesgQueue osCreateMesgQueue_recomp
 #define osRecvMesg osRecvMesg_recomp
@@ -16,6 +30,7 @@
 #define osContGetReadData osContGetReadData_recomp
 #define osContStartQuery osContStartQuery_recomp
 #define osContGetQuery osContGetQuery_recomp
+#define RECOMP_PATCH __attribute__((section(".recomp_patch")))
 
 #define sinf __sinf_recomp
 #define cosf __cosf_recomp

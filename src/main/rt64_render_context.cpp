@@ -5,6 +5,7 @@
 
 #define HLSL_CPU
 #include "hle/rt64_application.h"
+#include "render/rt64_vi_renderer.h"
 #include "rt64_render_hooks.h"
 #include "overloaded.h"
 
@@ -129,17 +130,21 @@ void set_application_user_config(RT64::Application* application, const ultramode
     switch (config.res_option) {
         default:
         case ultramodern::renderer::Resolution::Auto:
-            application->userConfig.resolution = RT64::UserConfiguration::Resolution::WindowIntegerScale;
-            application->userConfig.downsampleMultiplier = 1;
+            // AUTO is deprecated in the UI (it scales incorrectly on some setups). Treat it as Original 2x.
+            [[fallthrough]];
+        case ultramodern::renderer::Resolution::Original2x:
+            application->userConfig.resolution = RT64::UserConfiguration::Resolution::Manual;
+            application->userConfig.resolutionMultiplier = 2.0 * std::max(config.ds_option, 1);
+            application->userConfig.downsampleMultiplier = std::max(config.ds_option, 1);
             break;
         case ultramodern::renderer::Resolution::Original:
             application->userConfig.resolution = RT64::UserConfiguration::Resolution::Manual;
             application->userConfig.resolutionMultiplier = std::max(config.ds_option, 1);
             application->userConfig.downsampleMultiplier = std::max(config.ds_option, 1);
             break;
-        case ultramodern::renderer::Resolution::Original2x:
+        case ultramodern::renderer::Resolution::Original4x:
             application->userConfig.resolution = RT64::UserConfiguration::Resolution::Manual;
-            application->userConfig.resolutionMultiplier = 2.0 * std::max(config.ds_option, 1);
+            application->userConfig.resolutionMultiplier = 4.0 * std::max(config.ds_option, 1);
             application->userConfig.downsampleMultiplier = std::max(config.ds_option, 1);
             break;
     }
@@ -158,7 +163,8 @@ void set_application_user_config(RT64::Application* application, const ultramode
             break;
     }
 
-    application->userConfig.aspectRatio = to_rt64(config.ar_option);
+    // Lock aspect ratio to Original (ignore user setting).
+    application->userConfig.aspectRatio = RT64::UserConfiguration::AspectRatio::Original;
     application->userConfig.antialiasing = to_rt64(config.msaa_option);
     application->userConfig.refreshRate = to_rt64(config.rr_option);
     application->userConfig.refreshRateTarget = config.rr_manual_value;
@@ -358,7 +364,7 @@ void zelda64::renderer::RT64Context::enable_instant_present() {
     // Enable the present early presentation mode for minimal latency.
     // TODO: toggle or something
     // app->enhancementConfig.presentation.mode = RT64::EnhancementConfiguration::Presentation::Mode::PresentEarly;
-    app->enhancementConfig.presentation.mode = RT64::EnhancementConfiguration::Presentation::Mode::Console;
+    app->enhancementConfig.presentation.mode = RT64::EnhancementConfiguration::Presentation::Mode::PresentEarly;
 
     app->updateEnhancementConfig();
 }
@@ -459,6 +465,14 @@ bool zelda64::renderer::RT64SamplePositionsSupported() {
 
 bool zelda64::renderer::RT64HighPrecisionFBEnabled() {
     return high_precision_fb_enabled;
+}
+
+void zelda64::renderer::RT64SetCrtScanlinesEnabled(bool enabled) {
+    RT64::setCrtScanlinesEnabled(enabled);
+}
+
+bool zelda64::renderer::RT64CrtScanlinesEnabled() {
+    return RT64::getCrtScanlinesEnabled();
 }
 
 void zelda64::renderer::trigger_texture_pack_update() {

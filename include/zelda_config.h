@@ -88,6 +88,20 @@ namespace zelda64 {
     void set_analog_cam_mode(AnalogCamMode mode);
 
     void open_quit_game_prompt();
+
+    enum class CrtScanlinesMode {
+        On,
+        Off,
+        OptionCount
+    };
+
+    NLOHMANN_JSON_SERIALIZE_ENUM(zelda64::CrtScanlinesMode, {
+        {zelda64::CrtScanlinesMode::On, "On"},
+        {zelda64::CrtScanlinesMode::Off, "Off"}
+    });
+
+    CrtScanlinesMode get_crt_scanlines_mode();
+    void set_crt_scanlines_mode(CrtScanlinesMode mode);
 };
 
 #endif

@@ -45,6 +45,8 @@ namespace zelda64 {
         RT64::UserConfiguration::Antialiasing RT64MaxMSAA();
         bool RT64SamplePositionsSupported();
         bool RT64HighPrecisionFBEnabled();
+        void RT64SetCrtScanlinesEnabled(bool enabled);
+        bool RT64CrtScanlinesEnabled();
 
         void trigger_texture_pack_update();
         void enable_texture_pack(const recomp::mods::ModContext& context, const recomp::mods::ModHandle& mod);
