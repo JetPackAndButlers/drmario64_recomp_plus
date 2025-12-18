@@ -579,9 +579,6 @@ int main(int argc, char** argv) {
     // Set up console output to accept UTF-8 on windows
     SetConsoleOutputCP(CP_UTF8);
 
-    // Initialize native file dialogs.
-    NFD_Init();
-
     // Change to a font that supports Japanese characters
     CONSOLE_FONT_INFOEX cfi;
     cfi.cbSize = sizeof cfi;
@@ -718,8 +715,6 @@ int main(int argc, char** argv) {
         error_handling_callbacks,
         threads_callbacks
     );
-
-    NFD_Quit();
 
     if (preloaded) {
         release_preload(preload_context);

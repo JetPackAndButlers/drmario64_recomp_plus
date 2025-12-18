@@ -4,8 +4,54 @@
 #include "RmlUi/Core.h"
 
 namespace zelda64 {
+    namespace {
+        struct NfdScope {
+            bool initialized = false;
+
+            NfdScope() {
+                // NFD requires per-thread initialization; dialogs may be opened from non-main threads.
+                const nfdresult_t init_result = NFD_Init();
+                initialized = (init_result == NFD_OKAY);
+
+                if (init_result == NFD_ERROR) {
+                    const char* err = NFD_GetError();
+                    SDL_ShowSimpleMessageBox(
+                        SDL_MESSAGEBOX_ERROR,
+                        "File Dialog Error",
+                        (err && err[0]) ? err : "Native file dialog initialization failed.",
+                        nullptr
+                    );
+                    NFD_ClearError();
+                }
+            }
+
+            ~NfdScope() {
+                if (initialized) {
+                    NFD_Quit();
+                }
+            }
+        };
+
+        void show_nfd_error_message(const char* title) {
+            const char* err = NFD_GetError();
+            SDL_ShowSimpleMessageBox(
+                SDL_MESSAGEBOX_ERROR,
+                title,
+                (err && err[0]) ? err : "Native file dialog failed.",
+                nullptr
+            );
+            NFD_ClearError();
+        }
+    }
+
     // MARK: - Internal Helpers
     void perform_file_dialog_operation(const std::function<void(bool, const std::filesystem::path&)>& callback) {
+        NfdScope nfd;
+        if (!nfd.initialized) {
+            callback(false, {});
+            return;
+        }
+
         nfdnchar_t* native_path = nullptr;
         nfdresult_t result = NFD_OpenDialogN(&native_path, nullptr, 0, nullptr);
 
@@ -16,11 +62,20 @@ namespace zelda64 {
             path = std::filesystem::path{native_path};
             NFD_FreePathN(native_path);
         }
+        else if (result == NFD_ERROR) {
+            show_nfd_error_message("File Dialog Error");
+        }
 
         callback(success, path);
     }
 
     void perform_file_dialog_operation_multiple(const std::function<void(bool, const std::list<std::filesystem::path>&)>& callback) {
+        NfdScope nfd;
+        if (!nfd.initialized) {
+            callback(false, {});
+            return;
+        }
+
         const nfdpathset_t* native_paths = nullptr;
         nfdresult_t result = NFD_OpenDialogMultipleN(&native_paths, nullptr, 0, nullptr);
 
@@ -38,6 +93,9 @@ namespace zelda64 {
                 }
             }
             NFD_PathSet_Free(native_paths);
+        }
+        else if (result == NFD_ERROR) {
+            show_nfd_error_message("File Dialog Error");
         }
 
         callback(success, paths);
